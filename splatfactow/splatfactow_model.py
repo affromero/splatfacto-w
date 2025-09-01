@@ -21,9 +21,15 @@ https://kevinxu02.github.io/gsw.github.io/
 from gsplat.cuda._wrapper import spherical_harmonics
 import math
 from dataclasses import dataclass, field
-from typing import Dict, List, Literal, Optional, Tuple, Type, Union
+from typing import Dict, List, Literal, Optional, Tuple, Type, Union, cast
 from nerfstudio.cameras.camera_utils import normalize
+from dn_splatter.dn_model import DNSplatterModelConfig, matrix_to_quaternion, rasterization_2dgs, rotate_vector_to_vector
+from dn_splatter.metrics import NormalMetrics, DepthMetrics
+from dn_splatter.regularization_strategy import DNRegularization, AGSMeshRegularization
+from dn_splatter.losses import DepthLoss, TVLoss
+from dn_splatter.utils.normal_utils import normal_from_depth_image
 from splatfactow.splatfactow_field import BGField, SplatfactoWField
+import torchvision.transforms.functional as TF
 
 import numpy as np
 import torch
@@ -153,6 +159,8 @@ class SplatfactoWModelConfig(ModelConfig):
     """Splatfacto Model Config, nerfstudio's implementation of Gaussian Splatting"""
 
     _target: Type = field(default_factory=lambda: SplatfactoWModel)
+    dn_config: DNSplatterModelConfig | None= None
+    """DN-Splatter model configuration"""
     warmup_length: int = 1000
     """period of steps where refinement is turned off"""
     refine_every: int = 100
@@ -307,6 +315,43 @@ class SplatfactoWModel(Model):
             colors = torch.nn.Parameter(torch.zeros((num_points, 3))).cuda()
 
         opacities = torch.nn.Parameter(torch.logit(0.1 * torch.ones(num_points, 1)))
+
+        # init normals if present
+        with torch.no_grad():
+            if (
+                self.seed_points is not None and len(self.seed_points) == 3
+            ):  # type: ignore
+                CONSOLE.print(
+                    "[bold yellow]Initialising Gaussian normals from intial seed points"
+                )
+                self.normals_seed = self.seed_points[-1].float()  # type: ignore
+                self.normals_seed = self.normals_seed / torch.norm(
+                    self.normals_seed, dim=-1, keepdim=True
+                )
+                normals = torch.nn.Parameter(self.normals_seed.detach())
+                scales = torch.log(avg_dist.repeat(1, 3))
+                scales[:, 2] = torch.log((avg_dist / 10)[:, 0])
+                scales = torch.nn.Parameter(scales.detach())
+                quats = torch.zeros(len(self.normals_seed), 4)
+                mat = rotate_vector_to_vector(
+                    torch.tensor(
+                        [0, 0, 1], dtype=torch.float, device=self.normals_seed.device
+                    ).repeat(self.normals_seed.shape[0], 1),
+                    self.normals_seed,
+                )
+                quats = matrix_to_quaternion(mat)
+                quats = torch.nn.Parameter(quats.detach())
+            else:
+                scales = torch.nn.Parameter(torch.log(avg_dist.repeat(1, 3)))
+                quats = torch.nn.Parameter(random_quat_tensor(num_points))
+
+                # init random normals based on the above scales and quats
+                normals = F.one_hot(torch.argmin(scales, dim=-1), num_classes=3).float()
+                rots = quat_to_rotmat(quats)
+                normals = torch.bmm(rots, normals[:, :, None]).squeeze(-1)
+                normals = F.normalize(normals, dim=1)
+                normals = torch.nn.Parameter(normals.detach())
+
         self.gauss_params = torch.nn.ParameterDict(
             {
                 "means": means,
@@ -315,6 +360,7 @@ class SplatfactoWModel(Model):
                 "appearance_features": appearance_features,
                 "colors": colors,
                 "opacities": opacities,
+                "normals": normals,
             }
         )
 
@@ -374,6 +420,8 @@ class SplatfactoWModel(Model):
 
         self.camera_idx = 0
 
+        self.initialize_dn_model()
+
     # def setup_shs(self, cam_idx: int):
     #     appearance_features = self.gauss_params["appearance_features"]
     #     appearance_embed = self.appearance_embeds(
@@ -388,8 +436,44 @@ class SplatfactoWModel(Model):
     #         appearance_features=appearance_features,
     #     )
 
+    def initialize_dn_model(self):
+        if self.config.dn_config is None:
+            return
+        config = cast(DNSplatterModelConfig, self.config.dn_config)
+        if config.use_normal_tv_loss:
+            self.tv_loss = TVLoss()
+
+        self.mse_loss = torch.nn.MSELoss()
+
+        # Depth Losses
+        if config.use_depth_loss:
+            self.depth_loss = DepthLoss(config.depth_loss_type)
+            assert config.depth_lambda > 0, "depth_lambda should be > 0"
+
+        if config.regularization_strategy == "dn-splatter":
+            self.regularization_strategy = DNRegularization()
+        elif config.regularization_strategy == "ags-mesh":
+            self.regularization_strategy = AGSMeshRegularization()
+        else:
+            raise NotImplementedError
+
+        if config.use_depth_loss:
+            self.regularization_strategy.depth_loss_type = config.depth_loss_type
+            self.regularization_strategy.depth_loss = DepthLoss(config.depth_loss_type)
+            self.regularization_strategy.depth_lambda = config.depth_lambda
+        else:
+            self.regularization_strategy.depth_loss_type = None
+            self.regularization_strategy.depth_loss = None
+
+        if not config.use_normal_loss:
+            self.regularization_strategy.normal_loss = None
+
     def set_camera_idx(self, cam_idx: int):
         self.camera_idx = cam_idx
+
+    @property
+    def normals(self):
+        return self.gauss_params["normals"]
 
     @property
     def shs_0(self):
@@ -981,10 +1065,7 @@ class SplatfactoWModel(Model):
         if self.config.rasterize_mode not in ["antialiased", "classic"]:
             raise ValueError("Unknown rasterize_mode: %s", self.config.rasterize_mode)
 
-        if self.config.output_depth_during_training or not self.training:
-            render_mode = "RGB+ED"
-        else:
-            render_mode = "RGB"
+        render_mode = "RGB+ED"
 
         if use_cached_sh and self.cached_colors is not None:
             colors = self.cached_colors
@@ -1068,7 +1149,13 @@ class SplatfactoWModel(Model):
         camera.rescale_output_resolution(camera_scale_fac)  # type: ignore
         rgb = torch.clamp(rgb, 0.0, 1.0)
 
-        # depth image
+        # --- camera ---
+        if hasattr(camera, "metadata"):
+            if camera.metadata is not None and "cam_idx" in camera.metadata:
+                self.camera_idx = camera.metadata["cam_idx"]  # type: ignore
+        self.camera = camera
+
+        # --- depth ---
         if render_mode == "RGB+ED":
             depth_im = render[:, ..., 3:4]
             depth_im = torch.where(
@@ -1076,6 +1163,58 @@ class SplatfactoWModel(Model):
             ).squeeze(0)
         else:
             depth_im = None
+
+        # --- normals ---
+        normals_im = torch.full(rgb.shape, 0.0)
+        if self.config.dn_config is not None and self.config.dn_config.predict_normals:
+            quats_crop = quats / quats.norm(dim=-1, keepdim=True)
+            normals = F.one_hot(
+                torch.argmin(self.scales, dim=-1), num_classes=3
+            ).float()
+            rots = quat_to_rotmat(quats_crop)
+            normals = torch.bmm(rots, normals[:, :, None]).squeeze(-1)
+            normals = F.normalize(normals, dim=1)
+            # update parameter group normals
+            self.gauss_params["normals"] = normals
+
+            # Use the current gsplat API for normal rendering
+            normals_im, _, _, _, _, _, _ = rasterization_2dgs(
+                means=means,
+                quats=quats / quats.norm(dim=-1, keepdim=True),
+                scales=torch.exp(scales).float(),
+                opacities=torch.sigmoid(opacities).squeeze(-1),
+                colors=normals,  # Use normals as colors for normal rendering
+                viewmats=viewmat,  # [1, 4, 4]
+                Ks=K,  # [1, 3, 3]
+                width=W,
+                height=H,
+                tile_size=BLOCK_WIDTH,
+                packed=False,
+                near_plane=0.01,
+                far_plane=1e10,
+                render_mode="RGB",  # We're rendering normals as RGB
+                sparse_grad=False,
+                absgrad=True,
+            )
+            # Convert normals from [-1, 1] to [0, 1] for visualization
+            normals_im = (normals_im + 1) / 2
+
+        # --- surface normal ---
+        surface_normal = normal_from_depth_image(
+            depths=depth_im.detach(),
+            fx=self.camera.fx.item(),
+            fy=self.camera.fy.item(),
+            cx=self.camera.cx.item(),
+            cy=self.camera.cy.item(),
+            img_size=(self.camera.width.item(), self.camera.height.item()),
+            c2w=torch.eye(4, dtype=torch.float, device=depth_im.device),
+            device=self.device,
+            smooth=False,
+        )
+        surface_normal = surface_normal @ torch.diag(
+            torch.tensor([1, -1, -1], device=depth_im.device, dtype=depth_im.dtype)
+        )
+        surface_normal = (1 + surface_normal) / 2
 
         if background.shape[0] == 3:
             background = background.expand(H, W, 3)
@@ -1085,6 +1224,8 @@ class SplatfactoWModel(Model):
             "depth": depth_im,  # type: ignore
             "accumulation": alpha.squeeze(0),  # type: ignore
             "background": background.squeeze(0),  # type: ignore
+            "normal": normals_im,  # predicted normal from gaussians
+            "surface_normal": surface_normal,  # normal from surface / depth
         }  # type: ignore
 
     def get_gt_img(self, image: torch.Tensor):
@@ -1220,7 +1361,125 @@ class SplatfactoWModel(Model):
             # Add loss from camera optimizer
             self.camera_optimizer.get_loss_dict(loss_dict)
 
+        if self.config.dn_config is not None:
+            loss_dict["dn_splatter_loss"] = self.get_loss_dn_splatter(outputs, batch)
+
+
         return loss_dict
+
+
+    def get_loss_dn_splatter(
+        self, outputs, batch
+    ) -> torch.Tensor:
+        """Computes and returns the losses dict.
+
+        Args:
+            outputs: the output to compute loss dict to
+            batch: ground truth batch corresponding to outputs
+            metrics_dict: dictionary of metrics, some of which we can use for loss
+        """
+        if self.config.dn_config is None:
+            return
+        config = cast(DNSplatterModelConfig, self.config.dn_config)
+        gt_img = self.get_gt_img(batch["image"])
+
+        # minimum to reasonable level
+        gt_img = self.get_gt_img(batch["image"]).clamp(min=10 / 255.0)
+        pred_img = outputs["rgb"]
+        depth_out = outputs["depth"]
+
+        sensor_depth_gt = None
+        mono_depth_gt = None
+        if "sensor_depth" in batch:
+            sensor_depth_gt = self.get_gt_img(batch["sensor_depth"])
+        if "mono_depth" in batch:
+            mono_depth_gt = self.get_gt_img(batch["mono_depth"])
+        if "normal" in batch:
+            batch["normal"] = self.get_gt_img(batch["normal"])
+        if "confidence" in batch:
+            confidence = 1 - self.get_gt_img(batch["confidence"]) / 255.0
+        else:
+            confidence = torch.ones_like(depth_out)
+
+        if "mask" in batch:
+            # batch["mask"] : [H, W, 1]
+            assert batch["mask"].shape[:2] == gt_img.shape[:2] == pred_img.shape[:2]
+            mask = batch["mask"].to(self.device)
+            depth_out = depth_out * mask
+            if "sensor_depth" in batch:
+                sensor_depth_gt = sensor_depth_gt * mask
+            if "mono_depth" in batch:
+                mono_depth_gt = mono_depth_gt * mask
+            if "normal" in batch:
+                batch["normal"] = batch["normal"] * mask
+            if "normal" in outputs:
+                outputs["normal"] = outputs["normal"] * mask
+
+        # RGB loss
+
+        pred_normal = outputs["normal"]
+        surface_normal = outputs["surface_normal"]
+        if "normal" in batch and self.config.dn_config is not None and self.config.dn_config.normal_supervision == "mono":
+            gt_normal = batch["normal"]
+        elif self.config.dn_config is not None and self.config.dn_config.normal_supervision == "depth":
+            gt_normal = normal_from_depth_image(
+                depths=depth_out.detach(),
+                fx=self.camera.fx.item(),
+                fy=self.camera.fy.item(),
+                cx=self.camera.cx.item(),
+                cy=self.camera.cy.item(),
+                img_size=(self.camera.width.item(), self.camera.height.item()),
+                c2w=torch.eye(4, dtype=torch.float, device=depth_out.device),
+                device=self.device,
+                smooth=False,
+            )
+            gt_normal = gt_normal @ torch.diag(
+                torch.tensor(
+                    [1, -1, -1], device=depth_out.device, dtype=depth_out.dtype
+                )
+            )
+            gt_normal = (1 + gt_normal) / 2
+        else:
+            gt_normal = None
+
+        depth_gt = None
+        if sensor_depth_gt is not None:
+            depth_gt = sensor_depth_gt
+        if mono_depth_gt is not None:
+            depth_gt = mono_depth_gt
+
+        if depth_gt is None and config.use_depth_loss:
+            CONSOLE.log(
+                "--pipeline.model.use-depth-loss is set to True but could not find depths to load. Remember to load depths in dataparser.",
+                style="bold yellow",
+            )
+
+        additional_data = {
+            "scales": self.scales,
+            "gt_img": gt_img,
+        }
+
+        if config.regularization_strategy == "dn-splatter":
+            regularization_strategy_loss = self.regularization_strategy(
+                pred_depth=depth_out,
+                gt_depth=depth_gt,
+                pred_normal=pred_normal,
+                gt_normal=gt_normal,
+                **additional_data,
+            )
+        elif config.regularization_strategy == "ags-mesh":
+            regularization_strategy_loss = self.regularization_strategy(
+                step=self.step,
+                pred_depth=depth_out,
+                gt_depth=depth_gt,
+                confidence_map=confidence,
+                surf_normal=(2 * surface_normal - 1).permute(2, 0, 1),
+                gt_normal=(2 * gt_normal - 1).permute(2, 0, 1),
+                pred_normal=(2 * pred_normal[0] - 1).permute(2, 0, 1),
+                **additional_data,
+            )
+
+        return regularization_strategy_loss
 
     @torch.no_grad()
     def get_outputs_for_camera(
@@ -1272,16 +1531,92 @@ class SplatfactoWModel(Model):
         # Switch images from [H, W, C] to [1, C, H, W] for metrics computations
         gt_rgb = torch.moveaxis(gt_rgb, -1, 0)[None, ...]
         predicted_rgb = torch.moveaxis(predicted_rgb, -1, 0)[None, ...]
+        predicted_depth = (
+            outputs["depth"][0, ...]
+            if outputs["depth"].dim() == 4
+            else outputs["depth"]
+        )
+        predicted_normal = (
+            outputs["normal"][0, ...]
+            if outputs["normal"].dim() == 4
+            else outputs["normal"]
+        )
+        if "mask" in batch:
+            mask = batch["mask"].to(self.device)
+            gt_rgb = gt_rgb * mask
+            predicted_rgb = predicted_rgb * mask
 
         psnr = self.psnr(gt_rgb, predicted_rgb)
         ssim = self.ssim(gt_rgb, predicted_rgb)
         lpips = self.lpips(gt_rgb, predicted_rgb)
 
-        # all of these metrics will be logged as scalars
-        metrics_dict = {"psnr": float(psnr.item()), "ssim": float(ssim)}  # type: ignore
-        metrics_dict["lpips"] = float(lpips)
+        metrics_dict = {
+            "rgb_psnr": float(psnr.item()),
+            "rgb_ssim": float(ssim),
+            "rgb_lpips": float(lpips),
+        } 
 
-        images_dict = {"img": combined_rgb}
+        predicted_depth = outputs["depth"]
+        if "sensor_depth" in batch:
+            gt_depth = batch["sensor_depth"].to(self.device)
+
+            if predicted_depth.shape[:2] != gt_depth.shape[:2]:
+                predicted_depth = TF.resize(
+                    predicted_depth.permute(2, 0, 1), gt_depth.shape[:2], antialias=None
+                ).permute(1, 2, 0)
+
+            gt_depth = gt_depth.to(torch.float32)  # it is in float64 previous
+
+            if "mask" in batch:
+                gt_depth = gt_depth * mask
+                predicted_depth = predicted_depth * mask
+
+            # add depth eval metrics
+
+            (abs_rel, sq_rel, rmse, rmse_log, a1, a2, a3) = DepthMetrics()(
+                predicted_depth.permute(2, 0, 1), gt_depth.permute(2, 0, 1)
+            )
+            depth_metrics = {
+                "depth_abs_rel": float(abs_rel.item()),
+                "depth_sq_rel": float(sq_rel.item()),
+                "depth_rmse": float(rmse.item()),
+                "depth_rmse_log": float(rmse_log.item()),
+                "depth_a1": float(a1.item()),
+                "depth_a2": float(a2.item()),
+                "depth_a3": float(a3.item()),
+            }
+            metrics_dict.update(depth_metrics)
+            combined_depth = torch.cat([gt_depth, predicted_depth], dim=1)
+            combined_depth_normalized = combined_depth / combined_depth.max()
+
+        if "normal" in batch:
+            gt_normal = batch["normal"].to(self.device)
+
+            if gt_normal.shape != predicted_normal.shape:
+                predicted_normal = TF.resize(
+                    predicted_normal.permute(2, 0, 1),
+                    gt_normal.shape[:2],
+                    antialias=None,
+                ).permute(1, 2, 0)
+
+            (mae, rmse, mean_err, med_err) = NormalMetrics()(
+                predicted_normal.permute(2, 0, 1).unsqueeze(0),
+                gt_normal.permute(2, 0, 1).unsqueeze(0),
+            )
+            normal_metrics = {
+                "normal_mae": float(mae.item()),
+                "normal_rsme": float(rmse.item()),
+                "normal_mean_err": float(mean_err.item()),
+                "normal_med_err": float(med_err.item()),
+            }
+            metrics_dict.update(normal_metrics)
+            combined_normal = torch.cat([gt_normal, predicted_normal], dim=1)
+
+        images_dict = {
+            "img": combined_rgb,
+            "depth": combined_depth_normalized,
+            "normal": combined_normal,
+        }
 
         return metrics_dict, images_dict
 
